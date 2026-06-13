@@ -1,218 +1,264 @@
-# Filename: train_cnn_lstm.py
-
-import logging
 import os
-from matplotlib import pyplot as plt
-import pandas as pd
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+TMP_DIR = Path(tempfile.gettempdir())
+os.environ.setdefault("MPLCONFIGDIR", str(TMP_DIR / "upbitexp-matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(TMP_DIR / "upbitexp-cache"))
+
+import joblib
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import f1_score, confusion_matrix
-import seaborn as sns
-import joblib
+from torch.utils.data import DataLoader, Dataset
 
-# 하이퍼파라미터
-SEQ_LEN = 10  # 시퀀스 길이 (CSV 시퀀스 길이)
-PER_STEP_FEATURE = 8  # interval 당 featrue 개수
-BATCH_SIZE = 32
-EPOCHS = 50     
-LEARNING_RATE = 1e-3
+import config
+import feature_engineering as fe
+from model import CNNLSTM
 
-CSV_PATH = "dataset/sequence_dataset.csv"
 
-# 맥북이라 mts
-DEVICE = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-print("Using device:", DEVICE)
+PER_STEP_FEATURE = len(fe.FEATURE_COLS)
 
-# dataset 정의
+
 class SequenceDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)  # 분류라 long
+    def __init__(self, x_values, y_values):
+        self.x_values = torch.tensor(x_values, dtype=torch.float32)
+        self.y_values = torch.tensor(y_values, dtype=torch.long)
+
     def __len__(self):
-        return len(self.X)
+        return len(self.x_values)
+
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# CNN-LSTM 모델 정의
-class CNNLSTM(nn.Module):
-    def __init__(self, per_step_feature, num_classes=3):
-        super().__init__()
-        
-        # 1D CNN
-        self.conv1 = nn.Conv1d(in_channels=per_step_feature, out_channels=32, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        
-        # LSTM
-        self.lstm = nn.LSTM(input_size=32, hidden_size=64, batch_first=True)
-        
-        # FC
-        self.fc = nn.Linear(64, num_classes)
-    
-    def forward(self, x):
-        # x: (batch, seq_len=10, feature=8)
-        x = x.permute(0, 2, 1)        # (batch, 8, 10)
-        x = self.pool(self.relu(self.conv1(x)))  # (batch, 32, 5)
-        x = x.permute(0, 2, 1)        # (batch, 5, 32)
-
-        x, _ = self.lstm(x)
-        x = x[:, -1, :]               # last timestep
-        return self.fc(x)
+        return self.x_values[idx], self.y_values[idx]
 
 
-# CSV 데이터 로드
-df = pd.read_csv(CSV_PATH)
-print("CSV shape:", df.shape)
-
-# 라벨 분리
-X = df.drop(columns=['label']).values   # (N, 80)
-y = df['label'].values                  # (N,)
-
-# CSV는 이미 시퀀스 형태로 저장되어 있으므로 reshape만 수행
-num_samples = len(X)                    # N = 1039
-X = X.reshape(num_samples, SEQ_LEN, PER_STEP_FEATURE)  # (N, 10, 8)
+def get_device():
+    return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 
-print("X shape:", X.shape)
-print("y shape:", y.shape)
-print("Label distribution:", np.bincount(y)) # 클래스 분포 확인
-
-# 표준화 
-scaler = StandardScaler()
-X_2d = X.reshape(-1, PER_STEP_FEATURE)  # (num_samples * SEQ_LEN, PER_STEP_FEATURE)
-X_2d = scaler.fit_transform(X_2d)
-
-# scaler 저장
-os.makedirs("models", exist_ok=True)
-joblib.dump(scaler, "models/feature_scaler.pkl")
-print("Scaler saved to models/feature_scaler.pkl")
-
-# 다시 3D로 reshape
-X = X_2d.reshape(num_samples, SEQ_LEN, PER_STEP_FEATURE)
-
-# train/test split
-X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-train_dataset = SequenceDataset(X_train, y_train)
-val_dataset = SequenceDataset(X_val, y_val)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-# 모델 학습
-class_counts = np.bincount(y_train)
-class_weights = 1.0 / class_counts
-class_weights = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
-
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-model = CNNLSTM(PER_STEP_FEATURE).to(DEVICE)
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+def load_sequence_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    x_values = df.drop(columns=["label"]).values
+    y_values = df["label"].values
+    num_samples = len(x_values)
+    x_values = x_values.reshape(num_samples, config.SEQ_LEN, PER_STEP_FEATURE)
+    return x_values, y_values
 
 
-# 시각화를 위해 로그 저장
-train_losses = []
-val_losses = []
+def time_split(x_values, y_values, val_ratio=0.2):
+    split_idx = int(len(x_values) * (1 - val_ratio))
+    if split_idx <= 0 or split_idx >= len(x_values):
+        raise ValueError(f"Not enough samples for train/val split: {len(x_values)}")
 
-train_macro_f1s = []
-val_macro_f1s = []
+    return (
+        x_values[:split_idx],
+        x_values[split_idx:],
+        y_values[:split_idx],
+        y_values[split_idx:],
+    )
 
-for epoch in range(EPOCHS):
+
+def scale_train_val(x_train_raw, x_val_raw):
+    scaler = StandardScaler()
+    x_train_2d = x_train_raw.reshape(-1, PER_STEP_FEATURE)
+    x_val_2d = x_val_raw.reshape(-1, PER_STEP_FEATURE)
+
+    x_train = scaler.fit_transform(x_train_2d).reshape(
+        len(x_train_raw),
+        config.SEQ_LEN,
+        PER_STEP_FEATURE,
+    )
+    x_val = scaler.transform(x_val_2d).reshape(
+        len(x_val_raw),
+        config.SEQ_LEN,
+        PER_STEP_FEATURE,
+    )
+    return x_train, x_val, scaler
+
+
+def make_class_weights(y_train, device):
+    class_counts = np.bincount(y_train, minlength=3)
+    class_weights = np.divide(
+        1.0,
+        class_counts,
+        out=np.zeros_like(class_counts, dtype=float),
+        where=class_counts > 0,
+    )
+    return torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+
+def evaluate(model, data_loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for x_batch, y_batch in data_loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            out = model(x_batch)
+            loss = criterion(out, y_batch)
+
+            total_loss += loss.item() * x_batch.size(0)
+            all_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
+            all_labels.extend(y_batch.cpu().numpy())
+
+    avg_loss = total_loss / len(data_loader.dataset)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    return avg_loss, macro_f1, all_labels, all_preds
+
+
+def train_one_epoch(model, data_loader, criterion, optimizer, device):
     model.train()
-    total_train_loss = 0.0
-    all_train_preds = []
-    all_train_labels = []
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
 
-    for X_batch, y_batch in train_loader:
-        X_batch = X_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-        
+    for x_batch, y_batch in data_loader:
+        x_batch = x_batch.to(device)
+        y_batch = y_batch.to(device)
+
         optimizer.zero_grad()
-        out = model(X_batch)
+        out = model(x_batch)
         loss = criterion(out, y_batch)
         loss.backward()
         optimizer.step()
 
-        total_train_loss += loss.item() * X_batch.size(0)
-        preds = torch.argmax(out, dim=1)
-        all_train_preds.extend(preds.cpu().numpy())
-        all_train_labels.extend(y_batch.cpu().numpy())
+        total_loss += loss.item() * x_batch.size(0)
+        all_preds.extend(torch.argmax(out, dim=1).cpu().numpy())
+        all_labels.extend(y_batch.cpu().numpy())
 
-    avg_train_loss = total_train_loss / len(train_loader.dataset)
-    train_losses.append(avg_train_loss)
-    train_macro_f1 = f1_score(all_train_labels, all_train_preds, average='macro')
-    train_macro_f1s.append(train_macro_f1)
-
-    # 평가
-    model.eval()
-    all_val_preds = []
-    all_val_labels = []
-    total_val_loss = 0.0
-
-    with torch.no_grad():
-        for X_batch, y_batch in val_loader:
-            X_batch = X_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
-
-            out = model(X_batch)
-            loss = criterion(out, y_batch)
-            total_val_loss += loss.item() * X_batch.size(0)
-            
-            preds = torch.argmax(out, dim=1)
-            all_val_preds.extend(preds.cpu().numpy())
-            all_val_labels.extend(y_batch.cpu().numpy())
+    avg_loss = total_loss / len(data_loader.dataset)
+    macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    return avg_loss, macro_f1
 
 
-    avg_val_loss = total_val_loss / len(val_loader.dataset)
-    val_losses.append(avg_val_loss)
-    val_macro_f1 = f1_score(all_val_labels, all_val_preds, average='macro')
-    val_macro_f1s.append(val_macro_f1)
+def save_training_figures(train_losses, val_losses, train_macro_f1s, val_macro_f1s, labels, preds):
+    config.FIG_DIR.mkdir(exist_ok=True)
 
-    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Train Macro F1: {train_macro_f1:.4f} | Val Macro F1: {val_macro_f1:.4f}")
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Train vs Validation Loss")
+    plt.legend()
+    plt.grid()
+    plt.savefig(config.FIG_DIR / "train_val_loss.png")
+    plt.close()
 
-    scheduler.step()
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_macro_f1s, label="Train Macro F1")
+    plt.plot(val_macro_f1s, label="Val Macro F1")
+    plt.xlabel("Epoch")
+    plt.ylabel("Macro F1")
+    plt.title("Macro F1: Train vs Val")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(config.FIG_DIR / "train_val_macro_f1.png")
+    plt.close()
 
-# 시각화
-# loss 비교 그래프
-plt.figure(figsize=(8, 5))
-plt.plot(train_losses, label="Train Loss")
-plt.plot(val_losses, label="Val Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title("Train vs Validation Loss")
-plt.legend()
-plt.grid()
-plt.savefig("fig/train_val_loss.png")
-plt.show()
+    cm = confusion_matrix(labels, preds, labels=[0, 1, 2])
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Confusion Matrix")
+    plt.savefig(config.FIG_DIR / "confusion_matrix.png")
+    plt.close()
 
 
-# Macro F1 비교 그래프
-plt.figure(figsize=(8,5))
-plt.plot(train_macro_f1s, label="Train Macro F1")
-plt.plot(val_macro_f1s, label="Val Macro F1")
-plt.xlabel("Epoch")
-plt.ylabel("Macro F1")
-plt.title("Macro F1: Train vs Val")
-plt.legend()
-plt.grid(True)
-plt.savefig("fig/train_val_macro_f1.png")
-plt.show()
+def main():
+    device = get_device()
+    print("Using device:", device)
 
-# Confusion Matrix Heatmap (last epoch)
-cm = confusion_matrix(all_val_labels, all_val_preds)
-plt.figure(figsize=(5, 4))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.title("Confusion Matrix")
-plt.savefig("fig/confusion_matrix.png") 
-plt.show()
+    x_values, y_values = load_sequence_csv(config.CSV_PATH)
+    print("X shape:", x_values.shape)
+    print("y shape:", y_values.shape)
+    print("Label distribution:", np.bincount(y_values, minlength=3))
 
-# 모델 저장
-os.makedirs("models", exist_ok=True)
-torch.save(model.state_dict(), "models/cnn_lstm_model.pth")
-print("Model saved to models/cnn_lstm_model.pth")
+    x_train_raw, x_val_raw, y_train, y_val = time_split(x_values, y_values)
+    x_train, x_val, scaler = scale_train_val(x_train_raw, x_val_raw)
+
+    config.MODELS_DIR.mkdir(exist_ok=True)
+    joblib.dump(scaler, config.SCALER_PATH)
+    print(f"Scaler saved to {config.SCALER_PATH}")
+    print("Train label distribution:", np.bincount(y_train, minlength=3))
+    print("Val label distribution:", np.bincount(y_val, minlength=3))
+
+    train_loader = DataLoader(
+        SequenceDataset(x_train, y_train),
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        SequenceDataset(x_val, y_val),
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+    )
+
+    model = CNNLSTM(PER_STEP_FEATURE).to(device)
+    criterion = nn.CrossEntropyLoss(weight=make_class_weights(y_train, device))
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=1e-5,
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+    train_losses, val_losses = [], []
+    train_macro_f1s, val_macro_f1s = [], []
+    last_val_labels, last_val_preds = [], []
+
+    for epoch in range(config.EPOCHS):
+        train_loss, train_macro_f1 = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+        )
+        val_loss, val_macro_f1, last_val_labels, last_val_preds = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+        )
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_macro_f1s.append(train_macro_f1)
+        val_macro_f1s.append(val_macro_f1)
+
+        print(
+            f"Epoch {epoch + 1}/{config.EPOCHS} | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Train Macro F1: {train_macro_f1:.4f} | Val Macro F1: {val_macro_f1:.4f}"
+        )
+        scheduler.step()
+
+    save_training_figures(
+        train_losses,
+        val_losses,
+        train_macro_f1s,
+        val_macro_f1s,
+        last_val_labels,
+        last_val_preds,
+    )
+    torch.save(model.state_dict(), config.MODEL_PATH)
+    print(f"Model saved to {config.MODEL_PATH}")
+
+
+if __name__ == "__main__":
+    main()
