@@ -40,7 +40,7 @@ def _records_to_frame(records):
     return df.dropna(subset=["timestamp"])
 
 
-def split_closed_records(records, interval_sec, now=None):
+def split_closed_records(records, interval_sec, now=None, close_delay_intervals=0):
     """Return records for closed intervals and keep current interval records pending."""
     if not records:
         return [], []
@@ -54,7 +54,9 @@ def split_closed_records(records, interval_sec, now=None):
         else:
             now = now.tz_convert("UTC")
 
-    cutoff = now.floor(f"{interval_sec}s")
+    cutoff = now.floor(f"{interval_sec}s") - pd.Timedelta(
+        seconds=interval_sec * close_delay_intervals
+    )
     closed = []
     pending = []
 
@@ -130,17 +132,15 @@ def aggregate_interval(ticks, orderbooks, interval_sec=30):
     ohlcv = aggregate_ticks(ticks, interval_sec)
     ob = aggregate_orderbook(orderbooks, interval_sec)
 
-    if ohlcv.empty:
+    # tick과 orderbook이 모두 관측된 30초 interval만 모델 feature 후보로 사용한다.
+    # orderbook 결측을 0으로 채우면 실제 시장 상태가 아닌 결측값을 정상 신호처럼 학습할 수 있다.
+    if ohlcv.empty or ob.empty:
         return None
 
-    if not ob.empty:
-        ohlcv = ohlcv.merge(ob, on="interval", how="left")
-    else:
-        ohlcv[["bid_volume", "ask_volume", "bid_price", "ask_price"]] = 0.0
-
-    fill_cols = ["bid_volume", "ask_volume", "bid_price", "ask_price"]
-    ohlcv[fill_cols] = ohlcv[fill_cols].fillna(0.0)
-    return ohlcv
+    merged = ohlcv.merge(ob, on="interval", how="inner")
+    if merged.empty:
+        return None
+    return merged
 
 
 def compute_features_one_market(agg: pd.DataFrame):

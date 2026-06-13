@@ -10,10 +10,9 @@
 
 ## 파일 책임
 
-- `config.py`: interval, sequence length, threshold, 파일 경로, 학습 하이퍼파라미터 설정
-- `feature_engineering.py`: 닫힌 30초 interval 분리, 체결/호가 집계, feature 계산
-- `market_selector.py`: Upbit REST API 조회 및 변동성 상위 종목 선택
-- `ws_collector.py`: Upbit WebSocket 체결/호가 수집
+- `config.py`: interval, sequence length, label threshold, CSV/model/scaler/fig 경로 등 공통 계약 설정
+- `feature_engineering.py`: 닫힌 30초 interval 분리, 체결/호가 집계, OHLCV/orderbook interval 매칭, feature 계산
+- `upbit_client.py`: Upbit REST API 조회, 변동성 상위 종목 선택, WebSocket 체결/호가 수집
 - `model.py`: CNN-LSTM 모델 정의
 - `ml_dataset_creator.py`: 실시간 수집 데이터를 학습용 시퀀스 CSV로 저장
 - `train/train_cnn_lstm.py`: CSV 로드, time split, scaler fit, 모델 학습, 성능 그래프 저장
@@ -37,9 +36,10 @@ python realtime_action_check.py
 
 - 학습/추론 간 feature 순서와 의미는 반드시 `feature_engineering.FEATURE_COLS`를 기준으로 맞춥니다.
 - 모델 구조는 `model.CNNLSTM` 한 곳에서만 정의합니다.
-- 종목 선택 로직은 `market_selector.py`에만 둡니다.
-- WebSocket 수집 구현은 `ws_collector.py`에만 둡니다.
+- Upbit REST 조회, 종목 선택, WebSocket 수집 구현은 `upbit_client.py`에만 둡니다.
 - 30초봉 집계와 feature 계산은 `feature_engineering.py`에만 둡니다.
+- `config.py`에는 공통 입력/출력 계약만 두고, 학습 하이퍼파라미터와 수집 정책값은 각 실행 스크립트에서 관리합니다.
+- OHLCV와 orderbook은 interval 기준 `inner join`으로 결합하며, orderbook 결측 interval을 0으로 채워 학습시키지 않습니다.
 - 실행 스크립트에는 orchestration 로직만 남기고, 공통 계산 로직을 중복 작성하지 않습니다.
 - 실시간 예측은 feature row 10개 warm-up 이후 시작해야 합니다.
 - scaler는 train 데이터에만 fit하고 validation/test/실시간 데이터에는 transform만 적용합니다.
@@ -49,8 +49,8 @@ python realtime_action_check.py
 정식 `tests/` 스위트는 아직 없습니다. 변경 후 최소한 아래를 확인하세요.
 
 ```bash
-python3 -m py_compile config.py feature_engineering.py market_selector.py model.py ws_collector.py ml_dataset_creator.py train/train_cnn_lstm.py realtime_action_infer.py realtime_action_check.py upbit_data_collector.py
-python3 -c "import config, feature_engineering, market_selector, model, ws_collector, ml_dataset_creator, realtime_action_infer, realtime_action_check, upbit_data_collector; import train.train_cnn_lstm as t; x,y=t.load_sequence_csv(t.config.CSV_PATH); print(x.shape, y.shape)"
+python3 -m py_compile config.py feature_engineering.py model.py upbit_client.py ml_dataset_creator.py train/train_cnn_lstm.py realtime_action_infer.py realtime_action_check.py upbit_data_collector.py
+python3 -c "import config, feature_engineering, model, upbit_client, ml_dataset_creator, realtime_action_infer, realtime_action_check, upbit_data_collector; import train.train_cnn_lstm as t; x,y=t.load_sequence_csv(t.config.CSV_PATH); print(x.shape, y.shape)"
 ```
 
 모델 관련 변경 시 추가로 확인할 항목:
