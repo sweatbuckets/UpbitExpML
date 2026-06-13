@@ -9,25 +9,27 @@ import torch
 
 import config
 import feature_engineering as fe
-from market_selector import select_top_volatile_symbol
 from model import CNNLSTM
-from ws_collector import WSTickCollector
+from upbit_client import WSTickCollector, select_top_volatile_symbol
 
 
 ACTION_MAP = {"sell": 0, "hold": 1, "buy": 2}
 INV_ACTION_MAP = {value: key for key, value in ACTION_MAP.items()}
 
 
+# 맥북 MPS 사용 가능 시 GPU 가속 사용
 def get_device():
     return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 
+# 학습된 CNN-LSTM 모델 로드
 def load_model(device):
     model = CNNLSTM(len(fe.FEATURE_COLS))
     model.load_state_dict(torch.load(config.MODEL_PATH, map_location=device))
     return model.to(device).eval()
 
 
+# 실시간 tick/orderbook을 30초봉 feature로 변환
 def append_closed_intervals(collector, pending_ticks, pending_orderbooks, market_history):
     ticks_by_market, orderbooks_by_market = collector.pop_all()
     market = collector.markets[0]
@@ -57,17 +59,20 @@ def append_closed_intervals(collector, pending_ticks, pending_orderbooks, market
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
+    # 1. 현재 변동성이 가장 큰 KRW 종목 선택
     market = select_top_volatile_symbol()
     if not market:
         logging.error("No symbol selected. Exiting.")
         raise SystemExit(1)
     logging.info("Selected volatile symbol: %s", market)
 
+    # 2. 모델과 scaler 로드
     device = get_device()
     model = load_model(device)
     scaler = joblib.load(config.SCALER_PATH)
     logging.info("CNN-LSTM model loaded on device: %s", device)
 
+    # 3. 선택 종목 WebSocket 수집 시작
     collector = WSTickCollector([market], ticket="ml_realtime_infer")
     collector.start()
     logging.info("WebSocket collector started for %s", market)
@@ -80,6 +85,8 @@ def main():
 
     while True:
         time.sleep(config.INTERVAL_SEC)
+
+        # 4. 새로 닫힌 30초봉을 feature로 변환
         market_history, pending_ticks, pending_orderbooks, feat_df = append_closed_intervals(
             collector=collector,
             pending_ticks=pending_ticks,
@@ -92,14 +99,17 @@ def main():
         min_interval = last_interval if last_interval else pd.Timestamp(0, tz="UTC")
         new_rows = feat_df[feat_df["interval"] > min_interval]
         for _, row in new_rows.iterrows():
+            # 5. 학습 때 저장한 scaler로 실시간 feature 표준화
             feature_vector = [row[col] for col in fe.FEATURE_COLS]
             history.append(scaler.transform([feature_vector])[0])
             last_interval = row["interval"]
 
+            # 6. 최근 10개 feature row가 쌓일 때까지 warm-up
             if len(history) < config.SEQ_LEN:
                 logging.info("[%s] Warming up (%d/%d)", row["interval"], len(history), config.SEQ_LEN)
                 continue
 
+            # 7. 최근 10개 step으로 sell / hold / buy 예측
             x_tensor = torch.from_numpy(np.array(history, dtype=np.float32)).unsqueeze(0).to(device)
             with torch.no_grad():
                 pred = model(x_tensor).argmax(1).item()

@@ -1,4 +1,6 @@
+import copy
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -28,8 +30,20 @@ from model import CNNLSTM
 
 
 PER_STEP_FEATURE = len(fe.FEATURE_COLS)
+FEATURE_COLUMN_PATTERN = re.compile(r"^feature(\d+)_t(\d+)$")
+
+# 학습 전용 하이퍼파라미터
+BATCH_SIZE = 32
+EPOCHS = 50
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-5
+SCHEDULER_STEP_SIZE = 10
+SCHEDULER_GAMMA = 0.5
+VAL_RATIO = 0.2
+SPLIT_GAP_SIZE = config.SEQ_LEN
 
 
+# dataset 정의
 class SequenceDataset(Dataset):
     def __init__(self, x_values, y_values):
         self.x_values = torch.tensor(x_values, dtype=torch.float32)
@@ -46,28 +60,72 @@ def get_device():
     return torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
 
+# CSV 데이터 로드
+def get_ordered_feature_columns(df):
+    parsed_columns = []
+    for col in df.columns:
+        match = FEATURE_COLUMN_PATTERN.match(col)
+        if match:
+            feature_idx = int(match.group(1))
+            step_idx = int(match.group(2))
+            parsed_columns.append((step_idx, feature_idx, col))
+
+    expected_feature_count = config.SEQ_LEN * PER_STEP_FEATURE
+    if len(parsed_columns) != expected_feature_count:
+        raise ValueError(
+            f"Expected {expected_feature_count} feature columns, got {len(parsed_columns)}"
+        )
+
+    expected_pairs = {
+        (step_idx, feature_idx)
+        for step_idx in range(config.SEQ_LEN)
+        for feature_idx in range(PER_STEP_FEATURE)
+    }
+    actual_pairs = {(step_idx, feature_idx) for step_idx, feature_idx, _ in parsed_columns}
+    if actual_pairs != expected_pairs:
+        missing = sorted(expected_pairs - actual_pairs)
+        extra = sorted(actual_pairs - expected_pairs)
+        raise ValueError(f"Invalid feature columns. missing={missing}, extra={extra}")
+
+    return [col for _, _, col in sorted(parsed_columns)]
+
+
 def load_sequence_csv(csv_path):
     df = pd.read_csv(csv_path)
-    x_values = df.drop(columns=["label"]).values
+    if "sequence_start_interval" in df.columns:
+        df["sequence_start_interval"] = pd.to_datetime(df["sequence_start_interval"])
+        sort_cols = ["sequence_start_interval"]
+        if "market" in df.columns:
+            sort_cols.append("market")
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    feature_cols = get_ordered_feature_columns(df)
+    x_values = df[feature_cols].values
     y_values = df["label"].values
     num_samples = len(x_values)
     x_values = x_values.reshape(num_samples, config.SEQ_LEN, PER_STEP_FEATURE)
     return x_values, y_values
 
 
-def time_split(x_values, y_values, val_ratio=0.2):
+# train/validation split
+# rolling window overlap으로 인한 검증 leakage를 줄이기 위해 split 경계에 gap을 둔다.
+def time_split(x_values, y_values, val_ratio=VAL_RATIO, gap_size=SPLIT_GAP_SIZE):
     split_idx = int(len(x_values) * (1 - val_ratio))
-    if split_idx <= 0 or split_idx >= len(x_values):
+    val_start_idx = split_idx + gap_size
+    if split_idx <= 0 or val_start_idx >= len(x_values):
         raise ValueError(f"Not enough samples for train/val split: {len(x_values)}")
 
     return (
         x_values[:split_idx],
-        x_values[split_idx:],
+        x_values[val_start_idx:],
         y_values[:split_idx],
-        y_values[split_idx:],
+        y_values[val_start_idx:],
+        gap_size,
     )
 
 
+# 표준화
+# scaler는 train 데이터에만 fit하고 validation/실시간 데이터에는 transform만 적용한다.
 def scale_train_val(x_train_raw, x_val_raw):
     scaler = StandardScaler()
     x_train_2d = x_train_raw.reshape(-1, PER_STEP_FEATURE)
@@ -86,17 +144,7 @@ def scale_train_val(x_train_raw, x_val_raw):
     return x_train, x_val, scaler
 
 
-def make_class_weights(y_train, device):
-    class_counts = np.bincount(y_train, minlength=3)
-    class_weights = np.divide(
-        1.0,
-        class_counts,
-        out=np.zeros_like(class_counts, dtype=float),
-        where=class_counts > 0,
-    )
-    return torch.tensor(class_weights, dtype=torch.float32).to(device)
-
-
+# 평가
 def evaluate(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0.0
@@ -119,6 +167,7 @@ def evaluate(model, data_loader, criterion, device):
     return avg_loss, macro_f1, all_labels, all_preds
 
 
+# 모델 학습 1 epoch
 def train_one_epoch(model, data_loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -144,6 +193,7 @@ def train_one_epoch(model, data_loader, criterion, optimizer, device):
     return avg_loss, macro_f1
 
 
+# 시각화 저장
 def save_training_figures(train_losses, val_losses, train_macro_f1s, val_macro_f1s, labels, preds):
     config.FIG_DIR.mkdir(exist_ok=True)
 
@@ -183,45 +233,71 @@ def main():
     device = get_device()
     print("Using device:", device)
 
+    # CSV는 이미 시퀀스 형태로 저장되어 있으므로 reshape만 수행
     x_values, y_values = load_sequence_csv(config.CSV_PATH)
     print("X shape:", x_values.shape)
     print("y shape:", y_values.shape)
     print("Label distribution:", np.bincount(y_values, minlength=3))
 
-    x_train_raw, x_val_raw, y_train, y_val = time_split(x_values, y_values)
+    # 시간 순서 기반 split + gap 적용
+    x_train_raw, x_val_raw, y_train, y_val, split_gap = time_split(x_values, y_values)
     x_train, x_val, scaler = scale_train_val(x_train_raw, x_val_raw)
 
+    # scaler 저장
     config.MODELS_DIR.mkdir(exist_ok=True)
     joblib.dump(scaler, config.SCALER_PATH)
     print(f"Scaler saved to {config.SCALER_PATH}")
     print("Train label distribution:", np.bincount(y_train, minlength=3))
     print("Val label distribution:", np.bincount(y_val, minlength=3))
+    print(f"Split gap samples dropped: {split_gap}")
 
     train_loader = DataLoader(
         SequenceDataset(x_train, y_train),
-        batch_size=config.BATCH_SIZE,
+        batch_size=BATCH_SIZE,
         shuffle=True,
     )
     val_loader = DataLoader(
         SequenceDataset(x_val, y_val),
-        batch_size=config.BATCH_SIZE,
+        batch_size=BATCH_SIZE,
         shuffle=False,
     )
 
+    # 모델 학습 준비
+    # 손실함수에 class weights 도입
+    class_counts = np.bincount(y_train, minlength=3)
+    class_weights = np.divide(
+        1.0,
+        class_counts,
+        out=np.zeros_like(class_counts, dtype=float),
+        where=class_counts > 0,
+    )
+    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+    # CNN-LSTM 모델 / 손실함수 / optimizer 정의
     model = CNNLSTM(PER_STEP_FEATURE).to(device)
-    criterion = nn.CrossEntropyLoss(weight=make_class_weights(y_train, device))
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=1e-5,
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=SCHEDULER_STEP_SIZE,
+        gamma=SCHEDULER_GAMMA,
+    )
 
     train_losses, val_losses = [], []
     train_macro_f1s, val_macro_f1s = [], []
     last_val_labels, last_val_preds = [], []
+    best_val_macro_f1 = -1.0
+    best_epoch = 0
+    best_state_dict = None
+    best_val_labels, best_val_preds = [], []
 
-    for epoch in range(config.EPOCHS):
+    # 모델 학습
+    for epoch in range(EPOCHS):
+        # 1. train set으로 한 epoch 학습
         train_loss, train_macro_f1 = train_one_epoch(
             model,
             train_loader,
@@ -229,6 +305,8 @@ def main():
             optimizer,
             device,
         )
+
+        # 2. validation set으로 현재 epoch 성능 평가
         val_loss, val_macro_f1, last_val_labels, last_val_preds = evaluate(
             model,
             val_loader,
@@ -236,28 +314,46 @@ def main():
             device,
         )
 
+        # 3. loss / macro F1 로그 저장
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         train_macro_f1s.append(train_macro_f1)
         val_macro_f1s.append(val_macro_f1)
 
+        # 4. validation macro F1 기준 best model 갱신
+        if val_macro_f1 > best_val_macro_f1:
+            best_val_macro_f1 = val_macro_f1
+            best_epoch = epoch + 1
+            best_state_dict = copy.deepcopy(model.state_dict())
+            best_val_labels = list(last_val_labels)
+            best_val_preds = list(last_val_preds)
+
         print(
-            f"Epoch {epoch + 1}/{config.EPOCHS} | "
+            f"Epoch {epoch + 1}/{EPOCHS} | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Train Macro F1: {train_macro_f1:.4f} | Val Macro F1: {val_macro_f1:.4f}"
+            f"Train Macro F1: {train_macro_f1:.4f} | Val Macro F1: {val_macro_f1:.4f} | "
+            f"Best Val Macro F1: {best_val_macro_f1:.4f} @ Epoch {best_epoch}"
         )
+
+        # 5. learning rate scheduler 업데이트
         scheduler.step()
 
+    # loss / macro F1 / confusion matrix 저장
     save_training_figures(
         train_losses,
         val_losses,
         train_macro_f1s,
         val_macro_f1s,
-        last_val_labels,
-        last_val_preds,
+        best_val_labels,
+        best_val_preds,
     )
-    torch.save(model.state_dict(), config.MODEL_PATH)
-    print(f"Model saved to {config.MODEL_PATH}")
+
+    # 모델 저장
+    torch.save(best_state_dict, config.MODEL_PATH)
+    print(
+        f"Best model saved to {config.MODEL_PATH} "
+        f"(epoch={best_epoch}, val_macro_f1={best_val_macro_f1:.4f})"
+    )
 
 
 if __name__ == "__main__":

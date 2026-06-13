@@ -7,13 +7,23 @@ import pandas as pd
 
 import config
 import feature_engineering as fe
-from market_selector import select_top_volatile_symbols
-from ws_collector import WSTickCollector
+from upbit_client import WSTickCollector, select_top_volatile_symbols
 
 
 FEATURE_COLS = fe.FEATURE_COLS
 
 
+# Upbit KRW 마켓 전체에서 전일 종가 대비 절대 변동률이 큰 상위 N개 종목을 구독
+SELECT_TOP_N = 5
+
+# CSV가 무한히 커지지 않도록 최근 MAX_SEQUENCES개 시퀀스만 유지
+MAX_SEQUENCES = 2000
+
+# 방금 끝난 30초봉은 WebSocket 지연 체결이 늦게 들어올 수 있어 1개 interval 뒤에 확정
+CLOSE_DELAY_INTERVALS = 1
+
+
+# 단일 종목 feature row를 모델 입력 시퀀스와 다음 30초 라벨로 변환
 def create_sequences_one_market(df_feat, features, seq_len, threshold):
     label_len = 1
     if len(df_feat) < seq_len + label_len:
@@ -23,7 +33,10 @@ def create_sequences_one_market(df_feat, features, seq_len, threshold):
     returns = df_feat["last_return"].values
 
     for start in range(len(df_feat) - seq_len - label_len + 1):
+        # 입력: 최근 seq_len개 30초 feature
         x_rows.append(df_feat.iloc[start:start + seq_len][features].values)
+
+        # 라벨: 시퀀스 종료 직후 다음 30초 수익률
         future_return = returns[start + seq_len]
 
         if future_return >= threshold:
@@ -38,6 +51,7 @@ def create_sequences_one_market(df_feat, features, seq_len, threshold):
     return np.array(x_rows), np.array(y_rows), seq_ids
 
 
+# 여러 종목에서 생성된 시퀀스를 하나의 학습 batch 형태로 합침
 def create_sequences_all_markets(features_by_market, features, seq_len, threshold):
     x_all, y_all, seq_ids_all = [], [], []
 
@@ -61,7 +75,8 @@ def create_sequences_all_markets(features_by_market, features, seq_len, threshol
     return np.concatenate(x_all, axis=0), np.concatenate(y_all, axis=0), seq_ids_all
 
 
-def save_sequence_csv(x_all, y_all, feature_dim, seq_len, save_path):
+# 3D sequence 배열을 CSV 저장용 2D row로 펼침
+def save_sequence_csv(x_all, y_all, feature_dim, seq_len, save_path, sequence_ids=None):
     if x_all is None or len(x_all) == 0:
         logging.info("No sequences to save.")
         return
@@ -74,10 +89,29 @@ def save_sequence_csv(x_all, y_all, feature_dim, seq_len, save_path):
         for feature_idx in range(feature_dim)
     ]
     df = pd.DataFrame(x_flat, columns=columns)
+    if sequence_ids is not None:
+        # 새 CSV에서는 추적 가능한 메타데이터를 함께 저장
+        df.insert(0, "market", [market for market, _ in sequence_ids])
+        df.insert(
+            1,
+            "sequence_start_interval",
+            [pd.to_datetime(interval).isoformat() for _, interval in sequence_ids],
+        )
     df["label"] = y_all
+
+    if os.path.exists(save_path):
+        existing_columns = pd.read_csv(save_path, nrows=0).columns.tolist()
+        if "market" not in existing_columns or "sequence_start_interval" not in existing_columns:
+            # 기존 legacy CSV에 새 메타데이터 컬럼을 섞어 쓰지 않도록 호환 저장
+            logging.warning(
+                "Existing CSV has no sequence metadata. Appending legacy-compatible rows."
+            )
+            df = df[[col for col in df.columns if col in existing_columns]]
+
     df.to_csv(save_path, mode="a", header=not os.path.exists(save_path), index=False)
 
 
+# 종목별 30초봉 history를 갱신하고 ML-ready feature를 누적
 def append_market_features(market, agg, market_history, features_by_market):
     market_history[market] = (
         pd.concat([market_history.get(market, pd.DataFrame()), agg], ignore_index=True)
@@ -107,7 +141,14 @@ def append_market_features(market, agg, market_history, features_by_market):
     )
 
 
-def collect_closed_intervals(symbols, collector, pending_ticks, pending_orderbooks):
+# WebSocket에서 모은 raw tick/orderbook 중 확정된 interval만 집계
+def collect_closed_intervals(
+    symbols,
+    collector,
+    pending_ticks,
+    pending_orderbooks,
+    close_delay_intervals=CLOSE_DELAY_INTERVALS,
+):
     ticks_by_market, orderbooks_by_market = collector.pop_all()
     tick_summary = {market: len(ticks_by_market.get(market, [])) for market in symbols}
     logging.info("Interval collected ticks: %s", tick_summary)
@@ -118,13 +159,17 @@ def collect_closed_intervals(symbols, collector, pending_ticks, pending_orderboo
         raw_orderbooks = (
             pending_orderbooks.get(market, []) + orderbooks_by_market.get(market, [])
         )
+
+        # 데이터셋 품질을 위해 방금 닫힌 봉은 한 번 더 보류한다.
         ticks, pending_ticks[market] = fe.split_closed_records(
             raw_ticks,
             interval_sec=config.INTERVAL_SEC,
+            close_delay_intervals=close_delay_intervals,
         )
         orderbooks, pending_orderbooks[market] = fe.split_closed_records(
             raw_orderbooks,
             interval_sec=config.INTERVAL_SEC,
+            close_delay_intervals=close_delay_intervals,
         )
         agg = fe.aggregate_interval(
             ticks=ticks,
@@ -143,12 +188,14 @@ def main():
 
     config.DATASET_DIR.mkdir(exist_ok=True)
 
-    symbols = select_top_volatile_symbols(config.SELECT_TOP_N)
+    # 1. 변동성 상위 종목 선택
+    symbols = select_top_volatile_symbols(SELECT_TOP_N)
     if not symbols:
         logging.error("No symbols selected. Exiting.")
         raise SystemExit(1)
     logging.info("Selected volatile symbols: %s", symbols)
 
+    # 2. WebSocket 체결/호가 수집 시작
     collector = WSTickCollector(symbols, ticket="ml_dataset_collector")
     collector.start()
     logging.info("WebSocket collector started for %d symbols", len(symbols))
@@ -163,6 +210,8 @@ def main():
     try:
         while True:
             time.sleep(config.INTERVAL_SEC)
+
+            # 3. 확정된 30초 interval만 30초봉으로 집계
             interval_data = collect_closed_intervals(
                 symbols=symbols,
                 collector=collector,
@@ -170,9 +219,11 @@ def main():
                 pending_orderbooks=pending_orderbooks,
             )
 
+            # 4. 30초봉 history 기반 feature 계산
             for market, agg in interval_data.items():
                 append_market_features(market, agg, market_history, features_by_market)
 
+            # 5. 최근 10개 feature + 다음 30초 라벨 시퀀스 생성
             x_all, y_all, seq_ids = create_sequences_all_markets(
                 features_by_market=features_by_market,
                 features=FEATURE_COLS,
@@ -183,12 +234,13 @@ def main():
                 logging.info("No sequences yet")
                 continue
 
-            remaining_slots = config.MAX_SEQUENCES - len(saved_sequence_ids)
+            # 6. 이미 저장한 시퀀스는 제외하고 새 시퀀스만 CSV에 append
+            remaining_slots = MAX_SEQUENCES - len(saved_sequence_ids)
             if remaining_slots <= 0:
-                logging.info("Reached max sequences (%d). Stopping CSV save.", config.MAX_SEQUENCES)
+                logging.info("Reached max sequences (%d). Stopping CSV save.", MAX_SEQUENCES)
                 break
 
-            x_new, y_new = [], []
+            x_new, y_new, sequence_ids_new = [], [], []
             for x_row, y_row, (market, start_interval) in zip(x_all, y_all, seq_ids):
                 sequence_id = (market, pd.to_datetime(start_interval))
                 if sequence_id in saved_sequence_ids:
@@ -198,6 +250,7 @@ def main():
                 saved_sequence_ids.add(sequence_id)
                 x_new.append(x_row)
                 y_new.append(y_row)
+                sequence_ids_new.append(sequence_id)
 
             if x_new:
                 x_new = np.array(x_new)
@@ -208,6 +261,7 @@ def main():
                     feature_dim=len(FEATURE_COLS),
                     seq_len=seq_len,
                     save_path=config.CSV_PATH,
+                    sequence_ids=sequence_ids_new,
                 )
                 logging.info(
                     "Saved new sequences: %d (total=%d, shape=%s)",
@@ -216,8 +270,8 @@ def main():
                     x_new.shape,
                 )
 
-            if len(saved_sequence_ids) >= config.MAX_SEQUENCES:
-                logging.info("Reached max sequences (%d). Stopping CSV save.", config.MAX_SEQUENCES)
+            if len(saved_sequence_ids) >= MAX_SEQUENCES:
+                logging.info("Reached max sequences (%d). Stopping CSV save.", MAX_SEQUENCES)
                 break
 
             for market, df in features_by_market.items():
