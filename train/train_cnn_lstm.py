@@ -36,12 +36,13 @@ FEATURE_COLUMN_PATTERN = re.compile(r"^feature(\d+)_t(\d+)$")
 BATCH_SIZE = 32
 EPOCHS = 50
 LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 3e-5
+WEIGHT_DECAY = 1e-5
 SCHEDULER_STEP_SIZE = 10
 SCHEDULER_GAMMA = 0.5
 VAL_RATIO = 0.2
 SPLIT_GAP_SIZE = config.SEQ_LEN
-BEST_START_EPOCH = 10
+BEST_START_EPOCH = 5
+CLASS_WEIGHT_POWER = 0.5
 
 
 # dataset 정의
@@ -213,6 +214,10 @@ def train_one_epoch(model, data_loader, criterion, optimizer, device):
         out = model(x_batch)
         loss = criterion(out, y_batch)
         loss.backward()
+
+        # gradient clipping: gradient가 너무 커져서 학습이 튀는 것을 방지
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+
         optimizer.step()
 
         total_loss += loss.item() * x_batch.size(0)
@@ -296,17 +301,16 @@ def main():
     # 모델 학습 준비
     # 손실함수에 class weights 도입
     class_counts = np.bincount(y_train, minlength=3)
-    class_weights = np.divide(
-        1.0,
-        np.sqrt(class_counts),
-        out=np.zeros_like(class_counts, dtype=float),
-        where=class_counts > 0,
-    )
+    class_weights = (
+        class_counts.sum() / (len(class_counts) * class_counts)
+    ) ** CLASS_WEIGHT_POWER
+    class_weights = class_weights / class_weights.mean()
     class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print("Class weights:", class_weights.detach().cpu().numpy().round(4).tolist())
 
     # CNN-LSTM 모델 / 손실함수 / optimizer 정의
     model = CNNLSTM(PER_STEP_FEATURE).to(device)
-    # 완화된 class weights를 적용해 hold 편향을 줄이되 소수 클래스 loss 과증폭을 피한다.
+    # 완만한 class weights를 적용해 다수 클래스(hold) 편향을 줄인다.
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(
         model.parameters(),
