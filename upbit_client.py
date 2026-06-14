@@ -30,22 +30,40 @@ def get_tickers(markets):
     return resp.json()
 
 
-# 전일 종가 대비 등락률 절댓값이 큰 종목 N개 선택
-# signed_change_rate는 Upbit ticker가 제공하는 전일 종가 대비 등락률
-def select_top_volatile_symbols(n):
+# 24시간 거래대금 상위 후보군 안에서 전일 종가 대비 등락률 절댓값이 큰 종목 N개 선택
+# acc_trade_price_24h는 24시간 누적 거래대금, signed_change_rate는 전일 종가 대비 등락률
+def select_top_volatile_symbols(n, liquidity_candidate_n=30):
     markets = get_krw_markets()
     tickers = get_tickers(markets)
     if not tickers:
         return []
 
     df = pd.DataFrame(tickers)
+    df = df.sort_values("acc_trade_price_24h", ascending=False).head(liquidity_candidate_n).copy()
     df["absolute_change_rate"] = df["signed_change_rate"].abs()
-    return df.sort_values("absolute_change_rate", ascending=False).head(n)["market"].tolist()
+    display_df = df[["market", "acc_trade_price_24h", "absolute_change_rate"]].copy()
+    display_df["trade_value_24h_b_krw"] = display_df["acc_trade_price_24h"] / 100_000_000
+    display_df["volatility_pct"] = display_df["absolute_change_rate"] * 100
+    display_df = display_df[["market", "trade_value_24h_b_krw", "volatility_pct"]]
+    logging.info(
+        "Liquidity candidates by 24h trade value:\n%s",
+        display_df.to_string(
+            index=False,
+            formatters={
+                "trade_value_24h_b_krw": "{:,.1f}".format,
+                "volatility_pct": "{:.2f}%".format,
+            },
+        ),
+    )
+
+    selected = df.sort_values("absolute_change_rate", ascending=False).head(n)
+    logging.info("Selected symbols: %s", selected["market"].tolist())
+    return selected["market"].tolist()
 
 
 # 실시간 추론/검증용 단일 종목 선택
-def select_top_volatile_symbol():
-    symbols = select_top_volatile_symbols(1)
+def select_top_volatile_symbol(liquidity_candidate_n=30):
+    symbols = select_top_volatile_symbols(1, liquidity_candidate_n=liquidity_candidate_n)
     return symbols[0] if symbols else None
 
 

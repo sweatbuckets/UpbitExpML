@@ -41,6 +41,8 @@ SCHEDULER_STEP_SIZE = 10
 SCHEDULER_GAMMA = 0.5
 VAL_RATIO = 0.2
 SPLIT_GAP_SIZE = config.SEQ_LEN
+BEST_START_EPOCH = 5
+CLASS_WEIGHT_POWER = 0.5
 
 
 # dataset 정의
@@ -61,6 +63,36 @@ def get_device():
 
 
 # CSV 데이터 로드
+def make_feature_columns():
+    return [
+        f"feature{feature_idx}_t{step_idx}"
+        for step_idx in range(config.SEQ_LEN)
+        for feature_idx in range(PER_STEP_FEATURE)
+    ]
+
+
+def read_sequence_csv(csv_path):
+    df = pd.read_csv(csv_path)
+    if any(FEATURE_COLUMN_PATTERN.match(str(col)) for col in df.columns):
+        return df
+
+    expected_with_metadata = config.SEQ_LEN * PER_STEP_FEATURE + 3
+    expected_legacy = config.SEQ_LEN * PER_STEP_FEATURE + 1
+    raw_df = pd.read_csv(csv_path, header=None)
+    if raw_df.shape[1] == expected_with_metadata:
+        raw_df.columns = ["market", "sequence_start_interval"] + make_feature_columns() + ["label"]
+        return raw_df
+    if raw_df.shape[1] == expected_legacy:
+        raw_df.columns = make_feature_columns() + ["label"]
+        return raw_df
+
+    raise ValueError(
+        "Could not find sequence feature columns. "
+        f"Expected {expected_with_metadata} metadata columns or {expected_legacy} legacy columns, "
+        f"got {raw_df.shape[1]} columns."
+    )
+
+
 def get_ordered_feature_columns(df):
     parsed_columns = []
     for col in df.columns:
@@ -91,7 +123,7 @@ def get_ordered_feature_columns(df):
 
 
 def load_sequence_csv(csv_path):
-    df = pd.read_csv(csv_path)
+    df = read_sequence_csv(csv_path)
     if "sequence_start_interval" in df.columns:
         df["sequence_start_interval"] = pd.to_datetime(df["sequence_start_interval"])
         sort_cols = ["sequence_start_interval"]
@@ -182,6 +214,10 @@ def train_one_epoch(model, data_loader, criterion, optimizer, device):
         out = model(x_batch)
         loss = criterion(out, y_batch)
         loss.backward()
+
+        # gradient clipping: gradient가 너무 커져서 학습이 튀는 것을 방지
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+
         optimizer.step()
 
         total_loss += loss.item() * x_batch.size(0)
@@ -265,16 +301,16 @@ def main():
     # 모델 학습 준비
     # 손실함수에 class weights 도입
     class_counts = np.bincount(y_train, minlength=3)
-    class_weights = np.divide(
-        1.0,
-        class_counts,
-        out=np.zeros_like(class_counts, dtype=float),
-        where=class_counts > 0,
-    )
+    class_weights = (
+        class_counts.sum() / (len(class_counts) * class_counts)
+    ) ** CLASS_WEIGHT_POWER
+    class_weights = class_weights / class_weights.mean()
     class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print("Class weights:", class_weights.detach().cpu().numpy().round(4).tolist())
 
     # CNN-LSTM 모델 / 손실함수 / optimizer 정의
     model = CNNLSTM(PER_STEP_FEATURE).to(device)
+    # 완만한 class weights를 적용해 다수 클래스(hold) 편향을 줄인다.
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -319,9 +355,10 @@ def main():
         val_losses.append(val_loss)
         train_macro_f1s.append(train_macro_f1)
         val_macro_f1s.append(val_macro_f1)
+        val_pred_distribution = np.bincount(last_val_preds, minlength=3)
 
-        # 4. validation macro F1 기준 best model 갱신
-        if val_macro_f1 > best_val_macro_f1:
+        # 4. 초반 spike를 피하기 위해 BEST_START_EPOCH 이후부터 best model 갱신
+        if epoch + 1 >= BEST_START_EPOCH and val_macro_f1 > best_val_macro_f1:
             best_val_macro_f1 = val_macro_f1
             best_epoch = epoch + 1
             best_state_dict = copy.deepcopy(model.state_dict())
@@ -332,7 +369,8 @@ def main():
             f"Epoch {epoch + 1}/{EPOCHS} | "
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Train Macro F1: {train_macro_f1:.4f} | Val Macro F1: {val_macro_f1:.4f} | "
-            f"Best Val Macro F1: {best_val_macro_f1:.4f} @ Epoch {best_epoch}"
+            f"Best Val Macro F1: {best_val_macro_f1:.4f} @ Epoch {best_epoch} | "
+            f"Val Pred Distribution: {val_pred_distribution.tolist()}"
         )
 
         # 5. learning rate scheduler 업데이트
