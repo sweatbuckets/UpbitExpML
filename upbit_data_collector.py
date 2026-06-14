@@ -5,6 +5,7 @@ from upbit_client import WSTickCollector, get_krw_markets, select_top_volatile_s
 
 
 CHECK_INTERVAL = config.INTERVAL_SEC
+LIQUIDITY_CANDIDATE_N = 30
 TOP_N = 5
 SPAWN_WS = {}
 
@@ -20,7 +21,10 @@ def get_markets():
 
 # 변동성 상위 종목을 찾아 신규 종목만 WebSocket 구독
 def detect_high_volatility():
-    symbols = select_top_volatile_symbols(TOP_N)
+    symbols = select_top_volatile_symbols(
+        TOP_N,
+        liquidity_candidate_n=LIQUIDITY_CANDIDATE_N,
+    )
     new_symbols = [symbol for symbol in symbols if symbol not in SPAWN_WS]
     if not new_symbols:
         return
@@ -37,7 +41,10 @@ def detect_price_spike():
 
 
 if __name__ == "__main__":
-    print(f"Starting Upbit high volatility collector. interval={CHECK_INTERVAL}s top_n={TOP_N}")
+    print(
+        "Starting Upbit high volatility collector. "
+        f"interval={CHECK_INTERVAL}s candidate_n={LIQUIDITY_CANDIDATE_N} top_n={TOP_N}"
+    )
     try:
         while True:
             detect_high_volatility()

@@ -64,7 +64,6 @@ def main():
     if not market:
         logging.error("No symbol selected. Exiting.")
         raise SystemExit(1)
-    logging.info("Selected volatile symbol: %s", market)
 
     # 2. 모델과 scaler 로드
     device = get_device()

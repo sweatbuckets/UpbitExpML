@@ -13,7 +13,10 @@ from upbit_client import WSTickCollector, select_top_volatile_symbols
 FEATURE_COLS = fe.FEATURE_COLS
 
 
-# Upbit KRW 마켓 전체에서 전일 종가 대비 절대 변동률이 큰 상위 N개 종목을 구독
+# Upbit KRW 마켓 중 24시간 거래대금 상위 후보군 개수
+LIQUIDITY_CANDIDATE_N = 30
+
+# 거래대금 상위 후보군 안에서 전일 종가 대비 절대 변동률이 큰 상위 N개 종목을 구독
 SELECT_TOP_N = 5
 
 # CSV가 무한히 커지지 않도록 최근 MAX_SEQUENCES개 시퀀스만 유지
@@ -80,6 +83,8 @@ def save_sequence_csv(x_all, y_all, feature_dim, seq_len, save_path, sequence_id
     if x_all is None or len(x_all) == 0:
         logging.info("No sequences to save.")
         return
+    if sequence_ids is None:
+        raise ValueError("sequence_ids is required for metadata CSV output.")
 
     num_sequences = x_all.shape[0]
     x_flat = x_all.reshape(num_sequences, seq_len * feature_dim)
@@ -89,26 +94,17 @@ def save_sequence_csv(x_all, y_all, feature_dim, seq_len, save_path, sequence_id
         for feature_idx in range(feature_dim)
     ]
     df = pd.DataFrame(x_flat, columns=columns)
-    if sequence_ids is not None:
-        # 새 CSV에서는 추적 가능한 메타데이터를 함께 저장
-        df.insert(0, "market", [market for market, _ in sequence_ids])
-        df.insert(
-            1,
-            "sequence_start_interval",
-            [pd.to_datetime(interval).isoformat() for _, interval in sequence_ids],
-        )
+    # 새 CSV 스키마는 모든 row에 추적 가능한 메타데이터를 함께 저장한다.
+    df.insert(0, "market", [market for market, _ in sequence_ids])
+    df.insert(
+        1,
+        "sequence_start_interval",
+        [pd.to_datetime(interval).isoformat() for _, interval in sequence_ids],
+    )
     df["label"] = y_all
 
-    if os.path.exists(save_path):
-        existing_columns = pd.read_csv(save_path, nrows=0).columns.tolist()
-        if "market" not in existing_columns or "sequence_start_interval" not in existing_columns:
-            # 기존 legacy CSV에 새 메타데이터 컬럼을 섞어 쓰지 않도록 호환 저장
-            logging.warning(
-                "Existing CSV has no sequence metadata. Appending legacy-compatible rows."
-            )
-            df = df[[col for col in df.columns if col in existing_columns]]
-
-    df.to_csv(save_path, mode="a", header=not os.path.exists(save_path), index=False)
+    write_header = not os.path.exists(save_path) or os.path.getsize(save_path) == 0
+    df.to_csv(save_path, mode="a", header=write_header, index=False)
 
 
 # 종목별 30초봉 history를 갱신하고 ML-ready feature를 누적
@@ -189,11 +185,13 @@ def main():
     config.DATASET_DIR.mkdir(exist_ok=True)
 
     # 1. 변동성 상위 종목 선택
-    symbols = select_top_volatile_symbols(SELECT_TOP_N)
+    symbols = select_top_volatile_symbols(
+        SELECT_TOP_N,
+        liquidity_candidate_n=LIQUIDITY_CANDIDATE_N,
+    )
     if not symbols:
         logging.error("No symbols selected. Exiting.")
         raise SystemExit(1)
-    logging.info("Selected volatile symbols: %s", symbols)
 
     # 2. WebSocket 체결/호가 수집 시작
     collector = WSTickCollector(symbols, ticket="ml_dataset_collector")
