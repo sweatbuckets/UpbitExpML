@@ -35,8 +35,8 @@ FEATURE_COLUMN_PATTERN = re.compile(r"^feature(\d+)_t(\d+)$")
 # 학습 전용 하이퍼파라미터
 BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-5
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 3e-4
 SCHEDULER_STEP_SIZE = 10
 SCHEDULER_GAMMA = 0.5
 VAL_RATIO = 0.2
@@ -216,7 +216,7 @@ def train_one_epoch(model, data_loader, criterion, optimizer, device):
         loss.backward()
 
         # gradient clipping: gradient가 너무 커져서 학습이 튀는 것을 방지
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         optimizer.step()
 
