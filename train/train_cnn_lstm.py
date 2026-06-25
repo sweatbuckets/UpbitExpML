@@ -36,7 +36,7 @@ FEATURE_COLUMN_PATTERN = re.compile(r"^feature(\d+)_t(\d+)$")
 BATCH_SIZE = 32
 EPOCHS = 50
 LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 3e-4
+WEIGHT_DECAY = 1e-4
 SCHEDULER_STEP_SIZE = 10
 SCHEDULER_GAMMA = 0.5
 VAL_RATIO = 0.2
@@ -312,7 +312,7 @@ def main():
     model = CNNLSTM(PER_STEP_FEATURE).to(device)
     # 완만한 class weights를 적용해 다수 클래스(hold) 편향을 줄인다.
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
